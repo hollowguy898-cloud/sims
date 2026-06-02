@@ -15,6 +15,7 @@ Flood are deliberately simpler than Lekgolo:
 This asymmetry is key: Lekgolo = structure + coordination,
 Flood = replication + aggression. Different "physics of intelligence."
 """
+import math
 import numpy as np
 from config import (
     FLOOD_HEALTH, FLOOD_STRENGTH, FLOOD_SPEED, FLOOD_ATTACK_DAMAGE,
@@ -50,100 +51,96 @@ FLOOD_OBSERVATION_DIM = (FLOOD_OWN_STATE_DIM +
                          FLOOD_MAX_NEARBY_WORMS * FLOOD_PER_WORM_DIM +
                          FLOOD_MAX_NEARBY_FLOOD * FLOOD_PER_FLOOD_DIM)
 
+# Pre-compute offsets
+_FLOOD_WORM_OFFSET = FLOOD_OWN_STATE_DIM
+_FLOOD_FLOOD_OFFSET = _FLOOD_WORM_OFFSET + FLOOD_MAX_NEARBY_WORMS * FLOOD_PER_WORM_DIM
+
+# Squared vision for fast comparisons
+_FLOOD_VISION_SQ = FLOOD_VISION * FLOOD_VISION
+_FLOOD_ATTACK_RANGE_SQ = FLOOD_ATTACK_RANGE * FLOOD_ATTACK_RANGE
+
 
 def build_flood_observation(flood, nearby_worms: list, nearby_flood: list,
                             terrain: np.ndarray, biomass_fields: list,
                             worms_by_id: dict,
-                            attachment_system=None) -> np.ndarray:
+                            attachment_system=None,
+                            obs_out: np.ndarray | None = None) -> np.ndarray:
     """
     Build the observation vector for a single Flood agent.
 
-    Includes vulnerability signals: isolated thinkers, thin walls,
-    colony density.
+    Uses squared distance to avoid sqrt in hot loops.
+    Optionally writes into a pre-allocated buffer (obs_out).
     """
-    obs = np.zeros(FLOOD_OBSERVATION_DIM, dtype=np.float32)
+    if obs_out is None:
+        obs_out = np.zeros(FLOOD_OBSERVATION_DIM, dtype=np.float32)
+    else:
+        obs_out[:] = 0.0
 
     # --- Own state ---
-    obs[0] = flood.health / flood.max_health if flood.max_health > 0 else 0.0
-    obs[1] = np.sin(flood.orientation)
-    obs[2] = np.cos(flood.orientation)
-    obs[3] = flood.biomass / (FLOOD_REPRODUCE_BIOMASS_COST * 3)  # normalized
-    obs[4] = len(nearby_worms) / 20.0  # nearby infection count proxy
+    obs_out[0] = flood.health / flood.max_health if flood.max_health > 0 else 0.0
+    obs_out[1] = math.sin(flood.orientation)
+    obs_out[2] = math.cos(flood.orientation)
+    obs_out[3] = flood.biomass / (FLOOD_REPRODUCE_BIOMASS_COST * 3)
+    obs_out[4] = len(nearby_worms) / 20.0
 
     # Own signal
-    obs[5:5 + FLOOD_SIGNAL_DIM] = flood.signal
+    for i in range(FLOOD_SIGNAL_DIM):
+        obs_out[5 + i] = flood.signal[i]
 
     # Nearby densities
-    obs[9] = min(len(nearby_worms) / 20.0, 1.0)
-    obs[10] = min(len(nearby_flood) / 15.0, 1.0)
+    obs_out[9] = min(len(nearby_worms) / 20.0, 1.0)
+    obs_out[10] = min(len(nearby_flood) / 15.0, 1.0)
 
-    # Local biomass availability (check if in a biomass field)
+    # Local biomass availability
     local_biomass = 0.0
     for field in biomass_fields:
         fx, fy = field['center']
         d = flood.distance_to(fx, fy)
         if d <= field['radius']:
-            local_biomass = field['rate'] / 5.0  # normalize
+            local_biomass = field['rate'] / 5.0
             break
-    obs[11] = min(local_biomass, 1.0)
+    obs_out[11] = min(local_biomass, 1.0)
 
     # Vulnerability signal: is there an isolated thinker nearby?
     vulnerability = 0.0
     for worm in nearby_worms:
-        if worm.worm_type == 1 and worm.alive:  # Thinker
-            # Check if isolated (few attachments)
+        if worm.worm_type == 1 and worm.alive:
             if len(worm.attachments) <= 1:
                 vulnerability = 1.0
                 break
-    obs[12] = vulnerability
+    obs_out[12] = vulnerability
 
     # --- Nearby worms (Lekgolo) ---
-    worm_data = []
-    for worm in nearby_worms:
-        if not worm.alive:
-            continue
-        d = flood.distance_to(worm.x, worm.y)
-        if d <= FLOOD_VISION:
-            is_isolated = len(worm.attachments) <= 1
-            worm_data.append((d, worm, is_isolated))
+    # nearby_worms already filtered by distance in _build_all_flood_observations
+    # Sort by distance (already pre-sorted in the spatial grid query)
+    worm_list = [(flood.distance_to(w.x, w.y), w) for w in nearby_worms
+                 if w.alive and flood.distance_to_sq(w.x, w.y) <= _FLOOD_VISION_SQ]
+    worm_list.sort(key=lambda x: x[0])
+    worm_list = worm_list[:FLOOD_MAX_NEARBY_WORMS]
 
-    worm_data.sort(key=lambda x: x[0])
-    worm_data = worm_data[:FLOOD_MAX_NEARBY_WORMS]
-
-    offset = FLOOD_OWN_STATE_DIM
-    for i, (d, worm, is_isolated) in enumerate(worm_data):
-        base = offset + i * FLOOD_PER_WORM_DIM
-        obs[base] = (worm.x - flood.x) / FLOOD_VISION
-        obs[base + 1] = (worm.y - flood.y) / FLOOD_VISION
-        obs[base + 2] = 1.0 if worm.worm_type == 1 else 0.0  # is_thinker
-        obs[base + 3] = worm.health / worm.max_health if worm.max_health > 0 else 0.0
-        obs[base + 4] = 1.0 if is_isolated else 0.0
+    for i, (d, worm) in enumerate(worm_list):
+        base = _FLOOD_WORM_OFFSET + i * FLOOD_PER_WORM_DIM
+        obs_out[base] = (worm.x - flood.x) / FLOOD_VISION
+        obs_out[base + 1] = (worm.y - flood.y) / FLOOD_VISION
+        obs_out[base + 2] = 1.0 if worm.worm_type == 1 else 0.0
+        obs_out[base + 3] = worm.health / worm.max_health if worm.max_health > 0 else 0.0
+        obs_out[base + 4] = 1.0 if len(worm.attachments) <= 1 else 0.0
 
     # --- Nearby Flood ---
-    flood_data = []
-    for other in nearby_flood:
-        if not other.alive:
-            continue
-        d = flood.distance_to(other.x, other.y)
-        if d <= FLOOD_VISION:
-            flood_data.append((d, other))
+    flood_list = [(flood.distance_to(o.x, o.y), o) for o in nearby_flood
+                  if o.alive and o.id != flood.id and
+                  flood.distance_to_sq(o.x, o.y) <= _FLOOD_VISION_SQ]
+    flood_list.sort(key=lambda x: x[0])
+    flood_list = flood_list[:FLOOD_MAX_NEARBY_FLOOD]
 
-    flood_data.sort(key=lambda x: x[0])
-    flood_data = flood_data[:FLOOD_MAX_NEARBY_FLOOD]
+    for i, (d, other) in enumerate(flood_list):
+        base = _FLOOD_FLOOD_OFFSET + i * FLOOD_PER_FLOOD_DIM
+        obs_out[base] = (other.x - flood.x) / FLOOD_VISION
+        obs_out[base + 1] = (other.y - flood.y) / FLOOD_VISION
+        obs_out[base + 2] = other.health / other.max_health if other.max_health > 0 else 0.0
 
-    flood_offset = offset + FLOOD_MAX_NEARBY_WORMS * FLOOD_PER_WORM_DIM
-    for i, (d, other) in enumerate(flood_data):
-        base = flood_offset + i * FLOOD_PER_FLOOD_DIM
-        obs[base] = (other.x - flood.x) / FLOOD_VISION
-        obs[base + 1] = (other.y - flood.y) / FLOOD_VISION
-        obs[base + 2] = other.health / other.max_health if other.max_health > 0 else 0.0
+    return obs_out
 
-    return obs
-
-
-# ---------------------------------------------------------------------------
-# Flood actions
-# ---------------------------------------------------------------------------
 
 def decode_flood_action(action_vector: np.ndarray) -> dict:
     """
@@ -158,13 +155,9 @@ def decode_flood_action(action_vector: np.ndarray) -> dict:
     """
     action_type = int(np.clip(np.round(action_vector[0]),
                               0, FLOOD_NUM_DISCRETE_ACTIONS - 1))
-    params = action_vector[1:1 + FLOOD_ACTION_PARAM_DIM].copy()
+    params = action_vector[1:1 + FLOOD_ACTION_PARAM_DIM]
     return {'type': action_type, 'params': params}
 
-
-# ---------------------------------------------------------------------------
-# Flood agent class
-# ---------------------------------------------------------------------------
 
 class FloodOrganism:
     """
@@ -178,7 +171,7 @@ class FloodOrganism:
 
     _next_id = 0
 
-    def __init__(self, x: float, y: float):
+    def __init__(self, x: float, y: float, rng=None):
         self.id = FloodOrganism._next_id
         FloodOrganism._next_id += 1
 
@@ -188,12 +181,15 @@ class FloodOrganism:
         self.max_health = FLOOD_HEALTH
         self.strength = FLOOD_STRENGTH
         self.alive = True
-        self.orientation = np.random.uniform(0, 2 * np.pi)
+        if rng is not None:
+            self.orientation = rng.uniform(0, 2 * math.pi)
+        else:
+            self.orientation = np.random.uniform(0, 2 * math.pi)
         self.reproduce_timer = FLOOD_REPRODUCE_INTERVAL
-        self.biomass = FLOOD_REPRODUCE_BIOMASS_COST  # starts ready to reproduce
+        self.biomass = FLOOD_REPRODUCE_BIOMASS_COST
 
         # Communication signal - meaning is learned, not defined
-        self.signal = np.zeros(FLOOD_SIGNAL_DIM, dtype=np.float32)
+        self.signal = [0.0] * FLOOD_SIGNAL_DIM  # list for speed
 
         # Sensor caches (updated each timestep)
         self.nearby_worms: list = []
@@ -214,8 +210,17 @@ class FloodOrganism:
             self.alive = False
         return actual
 
+    def distance_to_sq(self, other_x: float, other_y: float) -> float:
+        """Squared distance — avoids sqrt."""
+        dx = self.x - other_x
+        dy = self.y - other_y
+        return dx * dx + dy * dy
+
     def distance_to(self, other_x: float, other_y: float) -> float:
-        return np.sqrt((self.x - other_x) ** 2 + (self.y - other_y) ** 2)
+        """Exact distance."""
+        dx = self.x - other_x
+        dy = self.y - other_y
+        return math.sqrt(dx * dx + dy * dy)
 
     def tick_timers(self):
         if self.alive:

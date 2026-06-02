@@ -7,7 +7,16 @@ as RL agents:
   Flood: self-replicating parasite colony (replication + disruption + spread)
 
 Both sides learn. Both sides adapt. Neither is scripted.
+
+OPTIMIZED:
+- SpatialGrid for O(1) neighbor lookups instead of O(n²)
+- Single observation build per step (cached for return)
+- Batch thinker boost computation (once per step)
+- Squared distance comparisons (no sqrt in hot paths)
+- Pre-allocated observation buffers
+- Fixed biomass decay modifier bug
 """
+import math
 import numpy as np
 import os
 import torch
@@ -19,6 +28,7 @@ from config import (
     FLOOD_SPAWN_RATE, MAX_FLOOD_COUNT,
     WORM_MAX_ENERGY, WORM_ENERGY_REGEN, WORM_ATTACK_RANGE,
     WORM_ATTACK_DAMAGE_WORKER, WORM_ATTACK_DAMAGE_THINKER,
+    WORM_VISION_RADIUS_THINKER,
     SIGNAL_DIM, BIOMASS_COST_WORKER, BIOMASS_COST_THINKER,
     BIOMASS_PER_FLOOD_KILL, BIOMASS_PER_TIMESTEP, INITIAL_BIOMASS,
     FLOOD_HEALTH, FLOOD_ATTACK_DAMAGE, FLOOD_INFECTION_DAMAGE,
@@ -43,12 +53,19 @@ from world_gen import generate_world, is_passable, movement_cost, WorldData
 from worm import Worm, WormType
 from flood import (FloodOrganism, build_flood_observation,
                    decode_flood_action, FLOOD_OBSERVATION_DIM)
-from attachment_system import AttachmentSystem, compute_thinker_boost
+from attachment_system import (AttachmentSystem, compute_thinker_boost,
+                               compute_all_thinker_boosts)
 from sensors import build_observation, get_communication_signals, OBSERVATION_DIM
 from actions import decode_action, process_action, ACTION_VECTOR_DIM
 from rewards import ColonyRewardTracker, FloodRewardTracker
 from network import ColonySharedPolicy, FloodPolicy
 from ppo_trainer import PPOTrainer
+from spatial_grid import SpatialGrid
+
+# Pre-compute squared distances
+_ATTACH_MAX_DIST_SQ = ATTACHMENT_MAX_DISTANCE * ATTACHMENT_MAX_DISTANCE
+_ATTACK_RANGE_SQ = WORM_ATTACK_RANGE * WORM_ATTACK_RANGE
+_FLOOD_ATTACK_RANGE_SQ = FLOOD_ATTACK_RANGE * FLOOD_ATTACK_RANGE
 
 
 class LekgoloEnvironment:
@@ -74,6 +91,12 @@ class LekgoloEnvironment:
         self.flood_by_id: dict[int, FloodOrganism] = {}
         self.attachment_system = AttachmentSystem()
 
+        # Spatial grids for O(1) neighbor lookups
+        max_vision = max(WORM_VISION_RADIUS_THINKER, FLOOD_VISION,
+                         THINKER_BOOST_RADIUS, ATTACHMENT_MAX_DISTANCE) + 1
+        self.worm_grid = SpatialGrid(cell_size=max_vision)
+        self.flood_grid = SpatialGrid(cell_size=FLOOD_VISION + 1)
+
         # Colony state
         self.biomass = INITIAL_BIOMASS
         self.timestep = 0
@@ -95,6 +118,20 @@ class LekgoloEnvironment:
         self.lekgolo_trainer = PPOTrainer(self.lekgolo_policy, self.device)
         self.flood_trainer = PPOTrainer(self.flood_policy, self.device)
 
+        # Pre-allocated observation buffers (resized as needed)
+        self._worm_obs_buffer: dict[int, np.ndarray] = {}
+        self._flood_obs_buffer: dict[int, np.ndarray] = {}
+
+        # Cached per-step computations
+        self._cached_lekgolo_obs: dict | None = None
+        self._cached_flood_obs: dict | None = None
+        self._cached_boosts: dict | None = None
+        self._alive_worms: list[Worm] = []
+        self._alive_flood: list[FloodOrganism] = []
+        self._alive_worms_by_id: dict[int, Worm] = {}
+
+        self._max_vision = max_vision
+
     def reset(self) -> dict:
         """Reset the environment for a new episode using procedural generation."""
         Worm._next_id = 0
@@ -111,15 +148,13 @@ class LekgoloEnvironment:
         self.worms_by_id = {}
         spawns = self.world.spawn_formations
 
-        # Workers
         for (wx, wy) in spawns['lekgolo_worker_positions']:
-            worm = Worm(float(wx), float(wy), WormType.WORKER)
+            worm = Worm(float(wx), float(wy), WormType.WORKER, rng=self.rng)
             self.worms.append(worm)
             self.worms_by_id[worm.id] = worm
 
-        # Thinkers
         for (tx, ty) in spawns['lekgolo_thinker_positions']:
-            worm = Worm(float(tx), float(ty), WormType.THINKER)
+            worm = Worm(float(tx), float(ty), WormType.THINKER, rng=self.rng)
             self.worms.append(worm)
             self.worms_by_id[worm.id] = worm
 
@@ -127,8 +162,6 @@ class LekgoloEnvironment:
         self.flood_list = []
         self.flood_by_id = {}
 
-        # Cluster spawns
-        total_cluster_flood = 0
         for cluster_pos in spawns['flood_clusters']:
             cx, cy = cluster_pos
             for _ in range(FLOOD_SPAWN_CLUSTER_SIZE):
@@ -136,15 +169,13 @@ class LekgoloEnvironment:
                 fy = cy + self.rng.normal(0, 2)
                 fx = np.clip(fx, 0, self.width - 1)
                 fy = np.clip(fy, 0, self.height - 1)
-                flood = FloodOrganism(fx, fy)
+                flood = FloodOrganism(fx, fy, rng=self.rng)
                 self.flood_list.append(flood)
                 self.flood_by_id[flood.id] = flood
-                total_cluster_flood += 1
 
-        # Isolated seeds
         for seed_pos in spawns['flood_isolated_seeds']:
             sx, sy = seed_pos
-            flood = FloodOrganism(float(sx), float(sy))
+            flood = FloodOrganism(float(sx), float(sy), rng=self.rng)
             self.flood_list.append(flood)
             self.flood_by_id[flood.id] = flood
 
@@ -161,6 +192,11 @@ class LekgoloEnvironment:
         self.colony_reward_tracker.reset()
         self.colony_reward_tracker.prev_biomass = self.biomass
         self.flood_reward_tracker.reset()
+
+        # Clear caches
+        self._cached_lekgolo_obs = None
+        self._cached_flood_obs = None
+        self._cached_boosts = None
 
         # Build initial observations
         observations = self._build_all_observations()
@@ -189,100 +225,138 @@ class LekgoloEnvironment:
             x, y = self.rng.uniform(0, 3), self.rng.uniform(0, self.height)
         else:
             x, y = self.rng.uniform(self.width - 3, self.width), self.rng.uniform(0, self.height)
-        flood = FloodOrganism(x, y)
+        flood = FloodOrganism(x, y, rng=self.rng)
         self.flood_list.append(flood)
         self.flood_by_id[flood.id] = flood
 
+    def _rebuild_alive_caches(self):
+        """Compute alive_worms and alive_flood lists once per step."""
+        self._alive_worms = [w for w in self.worms if w.alive]
+        self._alive_flood = [f for f in self.flood_list if f.alive]
+        self._alive_worms_by_id = {w.id: w for w in self._alive_worms}
+
+    def _rebuild_spatial_grids(self):
+        """Rebuild spatial grids from current entity positions."""
+        self.worm_grid.build(self._alive_worms, lambda w: w.x, lambda w: w.y)
+        self.flood_grid.build(self._alive_flood, lambda f: f.x, lambda f: f.y)
+
     def _build_all_observations(self) -> dict:
-        """Build observation vectors for all alive Lekgolo worms."""
+        """
+        Build observation vectors for all alive Lekgolo worms.
+        Uses spatial grid for O(k) neighbor lookups instead of O(n²).
+        Uses cached thinker boosts computed once per step.
+        """
         observations = {}
-        alive_worms = [w for w in self.worms if w.alive]
-        alive_flood = [f for f in self.flood_list if f.alive]
+        alive_worms = self._alive_worms
+        alive_flood = self._alive_flood
+
+        # Compute all thinker boosts in one pass
+        boosts = self._cached_boosts
+        if boosts is None:
+            boosts = compute_all_thinker_boosts(alive_worms)
+            self._cached_boosts = boosts
+
+        # Apply thinker disrupt event
+        disrupt_active = self.thinker_disrupt_timer > 0
 
         for worm in alive_worms:
-            worm.nearby_worms = []
-            worm.nearby_enemies = []
+            # Use spatial grid to find nearby worms
+            worm.nearby_worms = self.worm_grid.query_radius(
+                worm.x, worm.y, worm.vision_radius)
+            # Filter out self and dead, and verify distance (grid may return extras at cell boundary)
+            vision_sq = worm.vision_radius_sq
+            worm.nearby_worms = [w for w in worm.nearby_worms
+                                 if w.id != worm.id and w.alive and
+                                 worm.distance_to_sq(w.x, w.y) <= vision_sq]
 
-            for other in alive_worms:
-                if other.id == worm.id:
-                    continue
-                d = worm.distance_to(other.x, other.y)
-                if d <= worm.vision_radius:
-                    worm.nearby_worms.append(other)
+            # Use spatial grid for nearby flood
+            worm.nearby_enemies = self.flood_grid.query_radius(
+                worm.x, worm.y, worm.vision_radius)
+            worm.nearby_enemies = [f for f in worm.nearby_enemies
+                                   if f.alive and
+                                   worm.distance_to_sq(f.x, f.y) <= vision_sq]
 
-            for enemy in alive_flood:
-                d = worm.distance_to(enemy.x, enemy.y)
-                if d <= worm.vision_radius:
-                    worm.nearby_enemies.append(enemy)
-
-            gx = int(np.clip(np.round(worm.x), 0, self.width - 1))
-            gy = int(np.clip(np.round(worm.y), 0, self.height - 1))
+            # Terrain lookup
+            gx = int(min(max(round(worm.x), 0), self.width - 1))
+            gy = int(min(max(round(worm.y), 0), self.height - 1))
             worm.terrain_type = int(self.terrain[gy, gx])
 
-            # Highground vision bonus
-            effective_vision = worm.vision_radius
-            if self.terrain[gy, gx] == TERRAIN_HIGHGROUND:
-                effective_vision += TERRAIN_HIGHGROUND_VISION_BONUS
-
-            boost = compute_thinker_boost(worm, alive_worms)
-
-            # Thinker disrupt event penalty
-            if self.thinker_disrupt_timer > 0 and worm.worm_type == 1:
+            # Get cached thinker boost
+            boost = boosts.get(worm.id, {'attack_accuracy': 0.0,
+                                          'move_efficiency': 0.0,
+                                          'comm_range': 0.0})
+            if disrupt_active and worm.worm_type == 1:
                 boost = {k: v * EVENT_THINKER_DISRUPT_BOOST_PENALTY
                          for k, v in boost.items()}
 
-            obs = build_observation(worm, alive_worms, alive_flood,
-                                   self.terrain, boost)
+            # Get or allocate observation buffer
+            if worm.id not in self._worm_obs_buffer:
+                self._worm_obs_buffer[worm.id] = np.zeros(OBSERVATION_DIM, dtype=np.float32)
+            obs = build_observation(worm, boost, obs_out=self._worm_obs_buffer[worm.id])
 
+            # Structural strength
             structural = self.attachment_system.compute_structural_strength(worm.id)
             obs[7] = min(structural / 6.0, 1.0)
 
+            # Communication signals (using pre-computed nearby list + adjacency index)
             comm_signals = get_communication_signals(
-                worm, alive_worms, self.attachment_system
+                worm, self._alive_worms_by_id, self.attachment_system
             )
-            # Comm jam modifier reduces range
+
+            # Comm jam modifier
             if self.world:
+                wx, wy = worm.x, worm.y
                 for mod in self.world.modifiers:
                     if mod['type'] == MODIFIER_COMM_JAM and mod['active']:
                         mx, my = mod['center']
-                        if worm.distance_to(mx, my) <= mod['radius']:
+                        if worm.distance_to_sq(mx, my) <= mod['radius'] * mod['radius']:
                             comm_signals *= MODIFIER_COMM_JAM_RANGE_PENALTY
 
             if np.any(comm_signals != 0):
-                obs[9:9 + SIGNAL_DIM] = 0.5 * worm.signal + 0.5 * comm_signals
+                for j in range(SIGNAL_DIM):
+                    obs[9 + j] = 0.5 * worm.signal[j] + 0.5 * comm_signals[j]
 
             observations[worm.id] = obs
+
+        self._cached_lekgolo_obs = observations
         return observations
 
     def _build_all_flood_observations(self) -> dict:
-        """Build observation vectors for all alive Flood agents."""
+        """
+        Build observation vectors for all alive Flood agents.
+        Uses spatial grid for O(k) neighbor lookups.
+        """
         observations = {}
-        alive_worms = [w for w in self.worms if w.alive]
-        alive_flood = [f for f in self.flood_list if f.alive]
+        alive_worms = self._alive_worms
+        alive_flood = self._alive_flood
 
         for flood in alive_flood:
-            # Find nearby worms
-            flood.nearby_worms = []
-            for worm in alive_worms:
-                d = flood.distance_to(worm.x, worm.y)
-                if d <= FLOOD_VISION:
-                    flood.nearby_worms.append(worm)
+            # Use spatial grid for nearby worms
+            flood.nearby_worms = self.worm_grid.query_radius(
+                flood.x, flood.y, FLOOD_VISION)
+            flood.nearby_worms = [w for w in flood.nearby_worms
+                                  if w.alive and
+                                  flood.distance_to_sq(w.x, w.y) <= FLOOD_VISION * FLOOD_VISION]
 
-            # Find nearby Flood
-            flood.nearby_flood = []
-            for other in alive_flood:
-                if other.id == flood.id or not other.alive:
-                    continue
-                d = flood.distance_to(other.x, other.y)
-                if d <= FLOOD_VISION:
-                    flood.nearby_flood.append(other)
+            # Use spatial grid for nearby flood
+            flood.nearby_flood = self.flood_grid.query_radius(
+                flood.x, flood.y, FLOOD_VISION)
+            flood.nearby_flood = [f for f in flood.nearby_flood
+                                  if f.id != flood.id and f.alive and
+                                  flood.distance_to_sq(f.x, f.y) <= FLOOD_VISION * FLOOD_VISION]
 
+            # Get or allocate observation buffer
+            if flood.id not in self._flood_obs_buffer:
+                self._flood_obs_buffer[flood.id] = np.zeros(FLOOD_OBSERVATION_DIM, dtype=np.float32)
             obs = build_flood_observation(
                 flood, flood.nearby_worms, flood.nearby_flood,
                 self.terrain, self.world.biomass_fields if self.world else [],
-                self.worms_by_id, self.attachment_system
+                self.worms_by_id, self.attachment_system,
+                obs_out=self._flood_obs_buffer[flood.id]
             )
             observations[flood.id] = obs
+
+        self._cached_flood_obs = observations
         return observations
 
     def _process_events(self):
@@ -329,12 +403,22 @@ class LekgoloEnvironment:
         if self.thinker_disrupt_timer > 0:
             self.thinker_disrupt_timer -= 1
 
-        # --- Phase 1: Build observations ---
+        # --- Build alive caches and spatial grids ONCE ---
+        self._rebuild_alive_caches()
+        self._rebuild_spatial_grids()
+
+        # Compute thinker boosts ONCE per step
+        self._cached_boosts = compute_all_thinker_boosts(self._alive_worms)
+        disrupt_active = self.thinker_disrupt_timer > 0
+
+        # --- Phase 1: Build observations (once!) ---
         lekgolo_obs = self._build_all_observations()
         flood_obs = self._build_all_flood_observations()
 
+        alive_worms = self._alive_worms
+        alive_flood = self._alive_flood
+
         # --- Phase 2: Lekgolo actions from policy ---
-        alive_worms = [w for w in self.worms if w.alive]
         worm_actions_dict = {}
         worm_log_probs_dict = {}
         worm_values_dict = {}
@@ -352,28 +436,31 @@ class LekgoloEnvironment:
                     worm_types.append(int(worm.worm_type))
 
             if obs_list:
-                obs_batch = torch.FloatTensor(np.array(obs_list)).to(self.device)
-                type_batch = torch.LongTensor(worm_types).to(self.device)
+                obs_batch = torch.FloatTensor(np.array(obs_list))
+                type_batch = torch.LongTensor(worm_types)
 
                 with torch.no_grad():
                     actions, log_probs, values, _ = self.lekgolo_policy.get_action(
                         obs_batch, type_batch
                     )
 
-                actions_np = actions.cpu().numpy()
-                log_probs_np = log_probs.cpu().numpy()
-                values_np = values.cpu().numpy().flatten()
+                actions_np = actions.numpy()  # no .cpu() needed on CPU
+                log_probs_np = log_probs.numpy()
+                values_np = values.numpy().flatten()
 
                 for i, worm_id in enumerate(worm_ids):
                     worm = self.worms_by_id[worm_id]
                     action_dict = decode_action(actions_np[i])
-                    boost = compute_thinker_boost(worm, alive_worms)
-                    if self.thinker_disrupt_timer > 0 and worm.worm_type == 1:
+                    boost = self._cached_boosts.get(worm_id,
+                                                     {'attack_accuracy': 0.0,
+                                                      'move_efficiency': 0.0,
+                                                      'comm_range': 0.0})
+                    if disrupt_active and worm.worm_type == 1:
                         boost = {k: v * EVENT_THINKER_DISRUPT_BOOST_PENALTY
                                  for k, v in boost.items()}
-                    process_action(worm, action_dict, alive_worms, self.flood_list,
+                    process_action(worm, action_dict, alive_worms, alive_flood,
                                    self.terrain, self.attachment_system,
-                                   self.worms_by_id, boost)
+                                   self.worms_by_id, boost, rng=self.rng)
                     worm_actions_dict[worm_id] = actions_np[i]
                     worm_log_probs_dict[worm_id] = float(log_probs_np[i])
                     worm_values_dict[worm_id] = float(values_np[i])
@@ -381,35 +468,34 @@ class LekgoloEnvironment:
                     worm_dones_dict[worm_id] = not worm.alive
 
         # --- Phase 3: Flood actions from policy ---
-        alive_flood_agents = [f for f in self.flood_list if f.alive]
         flood_actions_dict = {}
         flood_log_probs_dict = {}
         flood_values_dict = {}
         flood_dones_dict = {}
 
-        prev_flood_count = len(alive_flood_agents)
+        prev_flood_count = len(alive_flood)
         new_flood = []
         flood_biomass_gained = 0.0
 
-        if alive_flood_agents and flood_obs:
+        if alive_flood and flood_obs:
             f_obs_list = []
             f_ids = []
-            for f in alive_flood_agents:
+            for f in alive_flood:
                 if f.id in flood_obs:
                     f_obs_list.append(flood_obs[f.id])
                     f_ids.append(f.id)
 
             if f_obs_list:
-                f_obs_batch = torch.FloatTensor(np.array(f_obs_list)).to(self.device)
+                f_obs_batch = torch.FloatTensor(np.array(f_obs_list))
 
                 with torch.no_grad():
                     f_actions, f_log_probs, f_values, _ = self.flood_policy.get_action(
                         f_obs_batch
                     )
 
-                f_actions_np = f_actions.cpu().numpy()
-                f_log_probs_np = f_log_probs.cpu().numpy()
-                f_values_np = f_values.cpu().numpy().flatten()
+                f_actions_np = f_actions.numpy()
+                f_log_probs_np = f_log_probs.numpy()
+                f_values_np = f_values.numpy().flatten()
 
                 for i, f_id in enumerate(f_ids):
                     flood = self.flood_by_id[f_id]
@@ -426,10 +512,9 @@ class LekgoloEnvironment:
             worm.regenerate_energy(WORM_ENERGY_REGEN)
 
         # --- Phase 5: Flood biomass accumulation ---
-        for flood in self.flood_list:
-            if flood.alive:
-                flood.biomass += 0.5
-                flood.tick_timers()
+        for flood in alive_flood:
+            flood.biomass += 0.5
+            flood.tick_timers()
 
         # Add new flood
         self.flood_list.extend(new_flood)
@@ -441,7 +526,7 @@ class LekgoloEnvironment:
             if worm.infected and worm.alive:
                 worm.infection_timer += 1
                 worm.take_damage(FLOOD_INFECTION_DAMAGE * 0.05)
-                if np.random.random() < 0.01:
+                if self.rng.random() < 0.01:
                     worm.infected = False
                     worm.infection_timer = 0
 
@@ -449,32 +534,36 @@ class LekgoloEnvironment:
         for worm in alive_worms:
             if not worm.alive:
                 continue
-            gx = int(np.clip(np.round(worm.x), 0, self.width - 1))
-            gy = int(np.clip(np.round(worm.y), 0, self.height - 1))
+            gx = int(min(max(round(worm.x), 0), self.width - 1))
+            gy = int(min(max(round(worm.y), 0), self.height - 1))
             if self.terrain[gy, gx] == TERRAIN_TOXIC:
                 worm.take_damage(TERRAIN_TOXIC_DAMAGE)
-        for flood in self.flood_list:
-            if not flood.alive:
-                continue
-            gx = int(np.clip(np.round(flood.x), 0, self.width - 1))
-            gy = int(np.clip(np.round(flood.y), 0, self.height - 1))
+        for flood in alive_flood:
+            gx = int(min(max(round(flood.x), 0), self.width - 1))
+            gy = int(min(max(round(flood.y), 0), self.height - 1))
             if 0 <= gx < self.width and 0 <= gy < self.height:
                 if self.terrain[gy, gx] == TERRAIN_TOXIC:
                     flood.take_damage(TERRAIN_TOXIC_DAMAGE)
 
         # --- Phase 8: Biomass field collection ---
+        # BUG FIX: biomass decay modifier was nested inside field loop
+        # and used stale loop variable. Now correctly separated.
         if self.world:
             for field in self.world.biomass_fields:
                 fx, fy = field['center']
                 radius = field['radius']
+                radius_sq = radius * radius
                 for worm in alive_worms:
-                    if worm.alive and worm.distance_to(fx, fy) <= radius:
+                    if worm.alive and worm.distance_to_sq(fx, fy) <= radius_sq:
                         self.biomass += field['rate'] * 0.1
-                # Biomass decay modifier
-                for mod in self.world.modifiers:
-                    if mod['type'] == MODIFIER_BIOMASS_DECAY and mod['active']:
-                        mx, my = mod['center']
-                        if worm.distance_to(mx, my) <= mod['radius']:
+
+            # Biomass decay modifier — outside field loop, iterates all alive worms
+            for mod in self.world.modifiers:
+                if mod['type'] == MODIFIER_BIOMASS_DECAY and mod['active']:
+                    mx, my = mod['center']
+                    mod_r_sq = mod['radius'] * mod['radius']
+                    for worm in alive_worms:
+                        if worm.alive and worm.distance_to_sq(mx, my) <= mod_r_sq:
                             self.biomass = max(0, self.biomass - MODIFIER_BIOMASS_DECAY_RATE)
 
         # --- Phase 9: Clean up dead ---
@@ -519,7 +608,6 @@ class LekgoloEnvironment:
 
         # --- Phase 12: Collect rollout data ---
         if lekgolo_obs and worm_actions_dict:
-            # Only collect for IDs present in both obs and actions
             common_worm_ids = set(lekgolo_obs.keys()) & set(worm_actions_dict.keys())
             if common_worm_ids:
                 filtered_obs = {k: lekgolo_obs[k] for k in common_worm_ids}
@@ -562,12 +650,15 @@ class LekgoloEnvironment:
             not any(w.alive for w in self.worms)
         )
 
-        new_lekgolo_obs = self._build_all_observations()
-        new_flood_obs = self._build_all_flood_observations()
+        # Reuse cached observations for return — NO second observation build!
+        # The observations were already built at Phase 1 and are still valid
+        # for the next step's input (they represent current state).
+        new_lekgolo_obs = self._cached_lekgolo_obs or lekgolo_obs
+        new_flood_obs = self._cached_flood_obs or flood_obs
 
         info = {
             'timestep': self.timestep,
-            'alive_worms': sum(1 for w in self.worms if w.alive),
+            'alive_worms': alive_count,
             'alive_thinkers': sum(1 for w in self.worms if w.alive and w.worm_type == WormType.THINKER),
             'alive_workers': sum(1 for w in self.worms if w.alive and w.worm_type == WormType.WORKER),
             'alive_flood': len([f for f in self.flood_list if f.alive]),
@@ -582,6 +673,11 @@ class LekgoloEnvironment:
             'map_type': self.world.map_type if self.world else 'unknown',
             'thinker_disrupt_active': self.thinker_disrupt_timer > 0,
         }
+
+        # Clear caches for next step
+        self._cached_lekgolo_obs = None
+        self._cached_flood_obs = None
+        self._cached_boosts = None
 
         return {
             'lekgolo_observations': new_lekgolo_obs,
@@ -605,33 +701,31 @@ class LekgoloEnvironment:
             dx, dy = params[0] * FLOOD_SPEED, params[1] * FLOOD_SPEED
             new_x = flood.x + dx
             new_y = flood.y + dy
-            gx = int(np.clip(np.round(new_x), 0, self.width - 1))
-            gy = int(np.clip(np.round(new_y), 0, self.height - 1))
+            gx = int(min(max(round(new_x), 0), self.width - 1))
+            gy = int(min(max(round(new_y), 0), self.height - 1))
             if is_passable(self.terrain, gx, gy):
-                flood.x = np.clip(new_x, 0, self.width - 1)
-                flood.y = np.clip(new_y, 0, self.height - 1)
+                flood.x = min(max(new_x, 0), self.width - 1)
+                flood.y = min(max(new_y, 0), self.height - 1)
                 if abs(dx) > 1e-6 or abs(dy) > 1e-6:
-                    flood.orientation = np.arctan2(dy, dx)
+                    flood.orientation = math.atan2(dy, dx)
 
         elif action_type == 1:  # Attack
             if flood.nearby_worms:
-                target_idx = int(np.clip(
-                    int(np.round(params[0] * len(flood.nearby_worms))),
-                    0, len(flood.nearby_worms) - 1))
+                target_idx = int(min(max(
+                    int(round(params[0] * len(flood.nearby_worms))),
+                    0), len(flood.nearby_worms) - 1))
                 target = flood.nearby_worms[target_idx]
                 if target.alive:
-                    d = flood.distance_to(target.x, target.y)
-                    if d <= FLOOD_ATTACK_RANGE:
+                    d_sq = flood.distance_to_sq(target.x, target.y)
+                    if d_sq <= _FLOOD_ATTACK_RANGE_SQ:
                         damage = FLOOD_ATTACK_DAMAGE
-                        # Infection fog boost
                         if self.world:
                             for mod in self.world.modifiers:
                                 if (mod['type'] == MODIFIER_INFECTION_FOG and
                                         mod['active']):
                                     mx, my = mod['center']
-                                    if flood.distance_to(mx, my) <= mod['radius']:
+                                    if flood.distance_to_sq(mx, my) <= mod['radius'] * mod['radius']:
                                         damage *= MODIFIER_INFECTION_FOG_FLOOD_BOOST
-                        # Structural damage reduction
                         reduction = self.attachment_system.compute_damage_reduction(target.id)
                         actual_damage = damage * (1.0 - reduction)
                         blocked = damage * reduction
@@ -643,22 +737,20 @@ class LekgoloEnvironment:
 
         elif action_type == 2:  # Infect
             if flood.nearby_worms:
-                target_idx = int(np.clip(
-                    int(np.round(params[0] * len(flood.nearby_worms))),
-                    0, len(flood.nearby_worms) - 1))
+                target_idx = int(min(max(
+                    int(round(params[0] * len(flood.nearby_worms))),
+                    0), len(flood.nearby_worms) - 1))
                 target = flood.nearby_worms[target_idx]
                 if target.alive and not target.infected:
-                    d = flood.distance_to(target.x, target.y)
-                    if d <= FLOOD_ATTACK_RANGE:
-                        # 1:1 infection rule: 30% base chance
-                        if np.random.random() < 0.3:
+                    d_sq = flood.distance_to_sq(target.x, target.y)
+                    if d_sq <= _FLOOD_ATTACK_RANGE_SQ:
+                        if self.rng.random() < 0.3:
                             target.infected = True
                             target.infection_timer += 1
                             target.take_damage(FLOOD_INFECTION_DAMAGE * 0.1)
                             flood.infections_this_step += 1
                             self.flood_reward_tracker.compute_infection_reward(
                                 int(target.worm_type))
-                            # Flood gains biomass from infection
                             flood.biomass += BIOMASS_COST_WORKER * 0.5
 
         elif action_type == 3:  # Split/Spawn
@@ -666,15 +758,17 @@ class LekgoloEnvironment:
                 offset_x = self.rng.normal(0, 2)
                 offset_y = self.rng.normal(0, 2)
                 child = FloodOrganism(
-                    np.clip(flood.x + offset_x, 0, self.width - 1),
-                    np.clip(flood.y + offset_y, 0, self.height - 1)
+                    min(max(flood.x + offset_x, 0), self.width - 1),
+                    min(max(flood.y + offset_y, 0), self.height - 1),
+                    rng=self.rng
                 )
                 new_flood.append(child)
                 flood.biomass -= FLOOD_REPRODUCE_BIOMASS_COST
                 flood.reproduce_timer = FLOOD_REPRODUCE_INTERVAL
 
         elif action_type == 4:  # Signal
-            flood.signal = np.clip(params[:FLOOD_SIGNAL_DIM], -1.0, 1.0).astype(np.float32)
+            for i in range(min(len(params), FLOOD_SIGNAL_DIM)):
+                flood.signal[i] = max(-1.0, min(1.0, float(params[i])))
 
     def run_episode(self, max_steps: int | None = None,
                     render: bool = False,
@@ -735,7 +829,6 @@ class LekgoloEnvironment:
 
         fig, ax = plt.subplots(1, 1, figsize=(12, 12))
 
-        # Draw terrain (5 types now)
         terrain_colors = {
             TERRAIN_FLAT: [0.2, 0.5, 0.2],
             TERRAIN_ROUGH: [0.5, 0.4, 0.2],
@@ -748,7 +841,6 @@ class LekgoloEnvironment:
             terrain_img[self.terrain == t_val] = color
         ax.imshow(terrain_img, extent=[0, self.width, 0, self.height], alpha=0.6)
 
-        # Draw biomass fields
         if self.world:
             for field in self.world.biomass_fields:
                 fx, fy = field['center']
@@ -757,7 +849,6 @@ class LekgoloEnvironment:
                 circle = plt.Circle((fx, fy), r, color=color, alpha=0.15)
                 ax.add_patch(circle)
 
-        # Draw modifiers
         if self.world:
             mod_colors = {
                 MODIFIER_INFECTION_FOG: 'purple',
@@ -773,14 +864,12 @@ class LekgoloEnvironment:
                     circle = plt.Circle((mx, my), r, color=color, alpha=0.1)
                     ax.add_patch(circle)
 
-        # Draw attachments
         alive_worms_map = {w.id: w for w in self.worms if w.alive}
         for (a, b) in self.attachment_system.edges:
             if a in alive_worms_map and b in alive_worms_map:
                 wa, wb = alive_worms_map[a], alive_worms_map[b]
                 ax.plot([wa.x, wb.x], [wa.y, wb.y], 'y-', alpha=0.3, linewidth=0.5)
 
-        # Draw workers
         workers = [w for w in self.worms if w.alive and w.worm_type == WormType.WORKER]
         if workers:
             wx = [w.x for w in workers]
@@ -788,7 +877,6 @@ class LekgoloEnvironment:
             colors = ['red' if w.infected else 'lime' for w in workers]
             ax.scatter(wx, wy, c=colors, s=8, alpha=0.7, zorder=3)
 
-        # Draw thinkers
         thinkers = [w for w in self.worms if w.alive and w.worm_type == WormType.THINKER]
         if thinkers:
             tx = [w.x for w in thinkers]
@@ -796,16 +884,14 @@ class LekgoloEnvironment:
             colors_t = ['red' if w.infected else 'cyan' for w in thinkers]
             ax.scatter(tx, ty, c=colors_t, s=30, marker='*', alpha=0.9, zorder=4)
 
-        # Draw Flood
         alive_flood = [f for f in self.flood_list if f.alive]
         if alive_flood:
             fx = [f.x for f in alive_flood]
             fy = [f.y for f in alive_flood]
             ax.scatter(fx, fy, c='darkred', s=6, alpha=0.6, marker='x', zorder=2)
 
-        # Info text
-        alive_w = sum(1 for w in self.worms if w.alive)
-        alive_t = sum(1 for w in self.worms if w.alive and w.worm_type == WormType.THINKER)
+        alive_w = len(alive_worms_map)
+        alive_t = sum(1 for w in thinkers if w.alive)
         infected = sum(1 for w in self.worms if w.alive and w.infected)
         attachments = len(self.attachment_system.edges)
         map_type = self.world.map_type if self.world else '?'

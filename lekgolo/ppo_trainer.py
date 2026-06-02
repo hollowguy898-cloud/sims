@@ -3,7 +3,10 @@ PPO (Proximal Policy Optimization) trainer for the Lekgolo colony.
 
 Uses the colony shared policy with separate worker/thinker networks.
 Implements the standard PPO algorithm with GAE (Generalized Advantage Estimation).
+
+OPTIMIZED: Removed unnecessary .cpu() calls on CPU tensors.
 """
+import itertools
 import numpy as np
 import torch
 import torch.nn as nn
@@ -203,8 +206,10 @@ class PPOTrainer:
                 # Gradient step
                 self.optimizer.zero_grad()
                 loss.backward()
-                nn.utils.clip_grad_norm_(self.policy.get_all_parameters(),
-                                        PPO_MAX_GRAD_NORM)
+                nn.utils.clip_grad_norm_(
+                    itertools.chain(self.policy.worker_policy.parameters(),
+                                    self.policy.thinker_policy.parameters()),
+                    PPO_MAX_GRAD_NORM)
                 self.optimizer.step()
 
                 # Track stats

@@ -116,7 +116,8 @@ class ColonyRewardTracker:
         alive_worm_ids = {w.id for w in alive_worms}
         connectivity_r = 0.0
         for thinker in alive_thinkers:
-            connected = attachment_system.get_neighbors(thinker.id)
+            # Use adjacency index for O(degree) lookup instead of O(E)
+            connected = attachment_system.adjacency.get(thinker.id, set())
             connected_alive = [c for c in connected if c in alive_worm_ids]
             connectivity_r += len(connected_alive) * REWARD_CONNECTED_WORKERS_PER_THINKER
         reward += connectivity_r

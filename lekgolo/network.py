@@ -12,6 +12,7 @@ Flood:
 The colony's physical structure (attachments) determines information flow.
 Attached worms share observations through the graph structure.
 """
+import itertools
 import numpy as np
 import torch
 import torch.nn as nn
@@ -201,8 +202,9 @@ class ColonySharedPolicy(nn.Module):
 
         return log_probs, values, entropies
 
-    def get_all_parameters(self) -> list:
-        return list(self.worker_policy.parameters()) + list(self.thinker_policy.parameters())
+    def get_all_parameters(self):
+        return itertools.chain(self.worker_policy.parameters(),
+                               self.thinker_policy.parameters())
 
 
 class FloodPolicy(nn.Module):
