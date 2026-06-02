@@ -9,6 +9,7 @@ as RL agents:
 Both sides learn. Both sides adapt. Neither is scripted.
 """
 import numpy as np
+import os
 import torch
 from collections import defaultdict
 
@@ -36,6 +37,7 @@ from config import (
     EVENT_THINKER_DISRUPT,
     EVENT_THINKER_DISRUPT_BOOST_PENALTY,
     FLOOD_SPAWN_CLUSTER_COUNT, FLOOD_SPAWN_CLUSTER_SIZE, FLOOD_SPAWN_ISOLATED_SEEDS,
+    setup_matplotlib_fonts, DEFAULT_FRAME_DIR,
 )
 from world_gen import generate_world, is_passable, movement_cost, WorldData
 from worm import Worm, WormType
@@ -690,7 +692,8 @@ class LekgoloEnvironment:
             step_result = self.step()
 
             if render and step % 10 == 0:
-                self.render(save_path=f'/home/z/my-project/download/frame_{step:06d}.png')
+                os.makedirs(DEFAULT_FRAME_DIR, exist_ok=True)
+                self.render(save_path=os.path.join(DEFAULT_FRAME_DIR, f'frame_{step:06d}.png'))
 
             # Periodic PPO updates
             if train:
@@ -727,12 +730,8 @@ class LekgoloEnvironment:
         import matplotlib
         matplotlib.use('Agg')
         import matplotlib.pyplot as plt
-        import matplotlib.font_manager as fm
 
-        fm.fontManager.addfont('/usr/share/fonts/truetype/chinese/SarasaMonoSC-Regular.ttf')
-        fm.fontManager.addfont('/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf')
-        plt.rcParams['font.sans-serif'] = ['Sarasa Mono SC', 'DejaVu Sans']
-        plt.rcParams['axes.unicode_minus'] = False
+        setup_matplotlib_fonts()
 
         fig, ax = plt.subplots(1, 1, figsize=(12, 12))
 

@@ -18,14 +18,15 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from environment import LekgoloEnvironment
-from config import MAX_STEPS_PER_EPISODE
+from config import MAX_STEPS_PER_EPISODE, DEFAULT_CHECKPOINT_DIR
 
 
 def train(num_episodes: int = 1000,
           save_interval: int = 10,
           render_interval: int = 50,
-          checkpoint_dir: str = '/home/z/my-project/download/checkpoints'):
+          checkpoint_dir: str | None = None):
     """Train both Lekgolo and Flood policies using PPO."""
+    checkpoint_dir = checkpoint_dir or DEFAULT_CHECKPOINT_DIR
     os.makedirs(checkpoint_dir, exist_ok=True)
 
     env = LekgoloEnvironment(seed=42)
@@ -129,7 +130,7 @@ if __name__ == '__main__':
     parser.add_argument('--save-interval', type=int, default=10)
     parser.add_argument('--render-interval', type=int, default=50)
     parser.add_argument('--checkpoint-dir', type=str,
-                        default='/home/z/my-project/download/checkpoints')
+                        default=None)
     args = parser.parse_args()
     train(num_episodes=args.episodes, save_interval=args.save_interval,
           render_interval=args.render_interval, checkpoint_dir=args.checkpoint_dir)

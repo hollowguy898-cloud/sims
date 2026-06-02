@@ -3,6 +3,55 @@ Configuration for the Lekgolo Colony Simulation.
 Only MAP_SIZE is hard-coded as a constant; everything else is tunable here.
 """
 
+import os
+
+# --- Paths (derived, not hardcoded) ---
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_CHECKPOINT_DIR = os.path.join(PROJECT_ROOT, 'checkpoints')
+DEFAULT_FRAME_DIR = os.path.join(PROJECT_ROOT, 'frames')
+
+def setup_matplotlib_fonts():
+    """
+    Configure matplotlib fonts safely across different systems.
+    Tries known font paths; falls back to DejaVu Sans (ships with matplotlib).
+    Never crashes if a specific font file is missing.
+    """
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.font_manager as fm
+    import matplotlib.pyplot as plt
+
+    # Candidate font files to try (in priority order)
+    # Each entry: (filepath, family_name_to_set)
+    candidates = [
+        ('/usr/share/fonts/truetype/chinese/NotoSansSC-Regular.ttf', 'Noto Sans SC'),
+        ('/usr/share/fonts/truetype/chinese/SarasaMonoSC-Regular.ttf', 'Sarasa Mono SC'),
+        ('/usr/share/fonts/truetype/sarasa-gothic/Sarasa-Gothic-Regular.ttc', 'Sarasa Gothic'),
+        ('/usr/share/fonts/truetype/lxgw-wenkai/LXGWWenKai-Regular.ttf', 'LXGW WenKai'),
+        ('/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc', 'WenQuanYi Zen Hei'),
+    ]
+    fallback_families = ['DejaVu Sans']
+
+    for font_path, family_name in candidates:
+        if os.path.exists(font_path):
+            try:
+                fm.fontManager.addfont(font_path)
+                fallback_families.insert(0, family_name)
+                break  # use the first one that works
+            except Exception:
+                continue
+
+    # Also try DejaVu Sans (always ships with matplotlib)
+    dejavu_path = '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf'
+    if os.path.exists(dejavu_path):
+        try:
+            fm.fontManager.addfont(dejavu_path)
+        except Exception:
+            pass
+
+    plt.rcParams['font.sans-serif'] = fallback_families
+    plt.rcParams['axes.unicode_minus'] = False
+
 # --- World ---
 MAP_WIDTH = 80
 MAP_HEIGHT = 80

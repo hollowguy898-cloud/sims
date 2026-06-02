@@ -14,12 +14,12 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from environment import LekgoloEnvironment
-from config import MAX_STEPS_PER_EPISODE, MAP_WIDTH, MAP_HEIGHT
+from config import MAX_STEPS_PER_EPISODE, MAP_WIDTH, MAP_HEIGHT, setup_matplotlib_fonts, DEFAULT_FRAME_DIR, DEFAULT_CHECKPOINT_DIR
 
 
 def render_episode(checkpoint_path: str | None = None,
                    num_steps: int = 500,
-                   output_dir: str = '/home/z/my-project/download/frames',
+                   output_dir: str | None = None,
                    seed: int = 42):
     """
     Run and render an episode, saving frames as PNGs.
@@ -30,6 +30,7 @@ def render_episode(checkpoint_path: str | None = None,
         output_dir: directory for frame images
         seed: random seed
     """
+    output_dir = output_dir or DEFAULT_FRAME_DIR
     os.makedirs(output_dir, exist_ok=True)
 
     env = LekgoloEnvironment(seed=seed)
@@ -67,7 +68,7 @@ def render_episode(checkpoint_path: str | None = None,
 
 
 def analyze_training(stats_path: str,
-                     output_path: str = '/home/z/my-project/download/training_analysis.png'):
+                     output_path: str | None = None):
     """
     Analyze and plot training statistics from a training_stats.json file.
 
@@ -78,12 +79,9 @@ def analyze_training(stats_path: str,
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
-    import matplotlib.font_manager as fm
 
-    fm.fontManager.addfont('/usr/share/fonts/truetype/chinese/SarasaMonoSC-Regular.ttf')
-    fm.fontManager.addfont('/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf')
-    plt.rcParams['font.sans-serif'] = ['Sarasa Mono SC', 'DejaVu Sans']
-    plt.rcParams['axes.unicode_minus'] = False
+    output_path = output_path or os.path.join(DEFAULT_FRAME_DIR, 'training_analysis.png')
+    setup_matplotlib_fonts()
 
     with open(stats_path, 'r') as f:
         stats = json.load(f)
@@ -147,8 +145,10 @@ def analyze_training(stats_path: str,
     print(f"Analysis saved to: {output_path}")
 
 
-def create_single_frame(output_path: str = '/home/z/my-project/download/lekgolo_state.png'):
+def create_single_frame(output_path: str | None = None):
     """Create a single visualization frame of the current simulation state."""
+    output_path = output_path or os.path.join(DEFAULT_FRAME_DIR, 'lekgolo_state.png')
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
     env = LekgoloEnvironment(seed=123)
     env.reset()
 
@@ -174,14 +174,14 @@ if __name__ == '__main__':
     parser.add_argument('--stats', type=str, default=None,
                         help='Path to training_stats.json')
     parser.add_argument('--output-dir', type=str,
-                        default='/home/z/my-project/download/frames',
+                        default=None,
                         help='Output directory')
     args = parser.parse_args()
 
     if args.mode == 'render':
-        render_episode(args.checkpoint, args.steps, args.output_dir)
+        render_episode(args.checkpoint, args.steps, args.output_dir or DEFAULT_FRAME_DIR)
     elif args.mode == 'analyze':
-        stats_path = args.stats or '/home/z/my-project/download/checkpoints/training_stats.json'
+        stats_path = args.stats or os.path.join(DEFAULT_CHECKPOINT_DIR, 'training_stats.json')
         analyze_training(stats_path)
     elif args.mode == 'snapshot':
         create_single_frame()

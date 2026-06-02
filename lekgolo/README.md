@@ -263,11 +263,11 @@ PPO (Proximal Policy Optimization) with GAE for both sides.
 **Flood:** Shared policy (32-hidden network, simpler — they compensate with numbers)
 
 ```bash
-# Activate venv
-source /home/z/my-project/lekgolo_venv/bin/activate
+# Install dependencies
+pip install torch numpy matplotlib
 
-# Train
-cd /home/z/my-project/sims/lekgolo
+# Train (from the lekgolo/ directory)
+cd lekgolo
 python train.py --episodes 1000
 
 # Render a snapshot
