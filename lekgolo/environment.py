@@ -9,10 +9,11 @@ as RL agents:
 Both sides learn. Both sides adapt. Neither is scripted.
 
 OPTIMIZED:
-- SpatialGrid for O(1) neighbor lookups instead of O(n²)
+- Vectorized numpy distance matrices — ONE C-level operation computes
+  ALL pairwise distances, then boolean masks assign neighbors. Zero Python
+  distance loops.
 - Single observation build per step (cached for return)
-- Batch thinker boost computation (once per step)
-- Squared distance comparisons (no sqrt in hot paths)
+- Batch thinker boost via distance matrix
 - Pre-allocated observation buffers
 - Fixed biomass decay modifier bug
 """
@@ -36,6 +37,8 @@ from config import (
     FLOOD_REPRODUCE_INTERVAL, FLOOD_REPRODUCE_BIOMASS_COST,
     FLOOD_SIGNAL_DIM, FLOOD_COMM_RADIUS,
     ATTACHMENT_MAX_DISTANCE, THINKER_BOOST_RADIUS,
+    THINKER_BOOST_ATTACK_ACCURACY, THINKER_BOOST_MOVE_EFFICIENCY,
+    THINKER_BOOST_COMM_RANGE,
     PPO_ROLLOUT_LENGTH,
     TERRAIN_FLAT, TERRAIN_ROUGH, TERRAIN_WALL, TERRAIN_TOXIC, TERRAIN_HIGHGROUND,
     TERRAIN_TOXIC_DAMAGE, TERRAIN_HIGHGROUND_VISION_BONUS,
@@ -53,19 +56,19 @@ from world_gen import generate_world, is_passable, movement_cost, WorldData
 from worm import Worm, WormType
 from flood import (FloodOrganism, build_flood_observation,
                    decode_flood_action, FLOOD_OBSERVATION_DIM)
-from attachment_system import (AttachmentSystem, compute_thinker_boost,
-                               compute_all_thinker_boosts)
+from attachment_system import AttachmentSystem, compute_thinker_boost
 from sensors import build_observation, get_communication_signals, OBSERVATION_DIM
 from actions import decode_action, process_action, ACTION_VECTOR_DIM
 from rewards import ColonyRewardTracker, FloodRewardTracker
 from network import ColonySharedPolicy, FloodPolicy
 from ppo_trainer import PPOTrainer
-from spatial_grid import SpatialGrid
+# No more spatial_grid — vectorized numpy distance matrices replace it
 
 # Pre-compute squared distances
 _ATTACH_MAX_DIST_SQ = ATTACHMENT_MAX_DISTANCE * ATTACHMENT_MAX_DISTANCE
 _ATTACK_RANGE_SQ = WORM_ATTACK_RANGE * WORM_ATTACK_RANGE
 _FLOOD_ATTACK_RANGE_SQ = FLOOD_ATTACK_RANGE * FLOOD_ATTACK_RANGE
+_THINKER_BOOST_RADIUS_SQ = THINKER_BOOST_RADIUS * THINKER_BOOST_RADIUS
 
 
 class LekgoloEnvironment:
@@ -90,12 +93,6 @@ class LekgoloEnvironment:
         self.worms_by_id: dict[int, Worm] = {}
         self.flood_by_id: dict[int, FloodOrganism] = {}
         self.attachment_system = AttachmentSystem()
-
-        # Spatial grids for O(1) neighbor lookups
-        max_vision = max(WORM_VISION_RADIUS_THINKER, FLOOD_VISION,
-                         THINKER_BOOST_RADIUS, ATTACHMENT_MAX_DISTANCE) + 1
-        self.worm_grid = SpatialGrid(cell_size=max_vision)
-        self.flood_grid = SpatialGrid(cell_size=FLOOD_VISION + 1)
 
         # Colony state
         self.biomass = INITIAL_BIOMASS
@@ -130,7 +127,14 @@ class LekgoloEnvironment:
         self._alive_flood: list[FloodOrganism] = []
         self._alive_worms_by_id: dict[int, Worm] = {}
 
-        self._max_vision = max_vision
+        # Distance matrix caches (rebuilt each step)
+        self._worm_pos: np.ndarray | None = None  # (W, 2)
+        self._flood_pos: np.ndarray | None = None  # (F, 2)
+        self._ww_dist_sq: np.ndarray | None = None  # (W, W) worm-worm squared dist
+        self._wf_dist_sq: np.ndarray | None = None  # (W, F) worm-flood squared dist
+        self._ff_dist_sq: np.ndarray | None = None  # (F, F) flood-flood squared dist
+        self._worm_idx: dict[int, int] = {}   # worm_id -> matrix index
+        self._flood_idx: dict[int, int] = {}  # flood_id -> matrix index
 
     def reset(self) -> dict:
         """Reset the environment for a new episode using procedural generation."""
@@ -230,51 +234,92 @@ class LekgoloEnvironment:
         self.flood_by_id[flood.id] = flood
 
     def _rebuild_alive_caches(self):
-        """Compute alive_worms and alive_flood lists once per step."""
+        """Compute alive lists AND vectorized distance matrices once per step."""
         self._alive_worms = [w for w in self.worms if w.alive]
         self._alive_flood = [f for f in self.flood_list if f.alive]
         self._alive_worms_by_id = {w.id: w for w in self._alive_worms}
 
-    def _rebuild_spatial_grids(self):
-        """Rebuild spatial grids from current entity positions."""
-        self.worm_grid.build(self._alive_worms, lambda w: w.x, lambda w: w.y)
-        self.flood_grid.build(self._alive_flood, lambda f: f.x, lambda f: f.y)
+        W = len(self._alive_worms)
+        F = len(self._alive_flood)
+
+        # Build index maps: entity_id -> matrix row/col
+        self._worm_idx = {w.id: i for i, w in enumerate(self._alive_worms)}
+        self._flood_idx = {f.id: i for i, f in enumerate(self._alive_flood)}
+
+        # Collect positions into numpy arrays — one C-level operation
+        if W > 0:
+            self._worm_pos = np.empty((W, 2), dtype=np.float64)
+            for i, w in enumerate(self._alive_worms):
+                self._worm_pos[i, 0] = w.x
+                self._worm_pos[i, 1] = w.y
+            # Worm-worm squared distance matrix: (W, W) — ONE numpy op
+            diff = self._worm_pos[:, None, :] - self._worm_pos[None, :, :]  # (W, W, 2)
+            self._ww_dist_sq = (diff * diff).sum(axis=2)  # (W, W)
+        else:
+            self._worm_pos = np.empty((0, 2), dtype=np.float64)
+            self._ww_dist_sq = np.empty((0, 0), dtype=np.float64)
+
+        if F > 0:
+            self._flood_pos = np.empty((F, 2), dtype=np.float64)
+            for i, f in enumerate(self._alive_flood):
+                self._flood_pos[i, 0] = f.x
+                self._flood_pos[i, 1] = f.y
+            # Flood-flood squared distance matrix: (F, F)
+            diff = self._flood_pos[:, None, :] - self._flood_pos[None, :, :]
+            self._ff_dist_sq = (diff * diff).sum(axis=2)
+        else:
+            self._flood_pos = np.empty((0, 2), dtype=np.float64)
+            self._ff_dist_sq = np.empty((0, 0), dtype=np.float64)
+
+        # Worm-flood cross distance matrix: (W, F)
+        if W > 0 and F > 0:
+            diff = self._worm_pos[:, None, :] - self._flood_pos[None, :, :]
+            self._wf_dist_sq = (diff * diff).sum(axis=2)
+        else:
+            self._wf_dist_sq = np.empty((max(W, 0), max(F, 0)), dtype=np.float64)
 
     def _build_all_observations(self) -> dict:
         """
         Build observation vectors for all alive Lekgolo worms.
-        Uses spatial grid for O(k) neighbor lookups instead of O(n²).
-        Uses cached thinker boosts computed once per step.
+        Uses pre-computed distance matrices — zero Python distance calls.
         """
         observations = {}
         alive_worms = self._alive_worms
         alive_flood = self._alive_flood
+        W = len(alive_worms)
+        F = len(alive_flood)
 
-        # Compute all thinker boosts in one pass
+        # Compute all thinker boosts from distance matrix (one vectorized op)
         boosts = self._cached_boosts
         if boosts is None:
-            boosts = compute_all_thinker_boosts(alive_worms)
+            boosts = self._compute_all_boosts_from_matrix()
             self._cached_boosts = boosts
 
-        # Apply thinker disrupt event
         disrupt_active = self.thinker_disrupt_timer > 0
 
-        for worm in alive_worms:
-            # Use spatial grid to find nearby worms
-            worm.nearby_worms = self.worm_grid.query_radius(
-                worm.x, worm.y, worm.vision_radius)
-            # Filter out self and dead, and verify distance (grid may return extras at cell boundary)
-            vision_sq = worm.vision_radius_sq
-            worm.nearby_worms = [w for w in worm.nearby_worms
-                                 if w.id != worm.id and w.alive and
-                                 worm.distance_to_sq(w.x, w.y) <= vision_sq]
+        # Pre-extract vision radii squared for each worm (as array for vectorized use)
+        vision_sq = np.array([w.vision_radius_sq for w in alive_worms], dtype=np.float64)
 
-            # Use spatial grid for nearby flood
-            worm.nearby_enemies = self.flood_grid.query_radius(
-                worm.x, worm.y, worm.vision_radius)
-            worm.nearby_enemies = [f for f in worm.nearby_enemies
-                                   if f.alive and
-                                   worm.distance_to_sq(f.x, f.y) <= vision_sq]
+        # --- Assign nearby_worms and nearby_enemies from distance matrices ---
+        for i, worm in enumerate(alive_worms):
+            vsq = vision_sq[i]
+
+            # Nearby worms: from worm-worm distance matrix
+            if W > 1:
+                row = self._ww_dist_sq[i]
+                mask = (row <= vsq)
+                mask[i] = False  # exclude self
+                worm.nearby_worms = [alive_worms[j] for j in range(W) if mask[j]]
+            else:
+                worm.nearby_worms = []
+
+            # Nearby enemies: from worm-flood distance matrix
+            if F > 0:
+                row = self._wf_dist_sq[i]
+                mask = (row <= vsq)
+                worm.nearby_enemies = [alive_flood[j] for j in range(F) if mask[j]]
+            else:
+                worm.nearby_enemies = []
 
             # Terrain lookup
             gx = int(min(max(round(worm.x), 0), self.width - 1))
@@ -298,7 +343,7 @@ class LekgoloEnvironment:
             structural = self.attachment_system.compute_structural_strength(worm.id)
             obs[7] = min(structural / 6.0, 1.0)
 
-            # Communication signals (using pre-computed nearby list + adjacency index)
+            # Communication signals
             comm_signals = get_communication_signals(
                 worm, self._alive_worms_by_id, self.attachment_system
             )
@@ -309,7 +354,9 @@ class LekgoloEnvironment:
                 for mod in self.world.modifiers:
                     if mod['type'] == MODIFIER_COMM_JAM and mod['active']:
                         mx, my = mod['center']
-                        if worm.distance_to_sq(mx, my) <= mod['radius'] * mod['radius']:
+                        r_sq = mod['radius'] * mod['radius']
+                        dx, dy = wx - mx, wy - my
+                        if dx * dx + dy * dy <= r_sq:
                             comm_signals *= MODIFIER_COMM_JAM_RANGE_PENALTY
 
             if np.any(comm_signals != 0):
@@ -321,29 +368,73 @@ class LekgoloEnvironment:
         self._cached_lekgolo_obs = observations
         return observations
 
+    def _compute_all_boosts_from_matrix(self) -> dict[int, dict]:
+        """Compute thinker boosts for ALL worms using the distance matrix.
+        Fully vectorized — no Python distance loops at all."""
+        alive_worms = self._alive_worms
+        W = len(alive_worms)
+        if W == 0:
+            return {}
+
+        # Find thinker indices
+        thinker_mask = np.array([w.worm_type == 1 for w in alive_worms])
+        thinker_indices = np.where(thinker_mask)[0]
+
+        boosts = {}
+        for i, worm in enumerate(alive_worms):
+            if worm.worm_type == 1:
+                boosts[worm.id] = {'attack_accuracy': 0.0, 'move_efficiency': 0.0, 'comm_range': 0.0}
+                continue
+
+            boost_a = 0.0
+            boost_m = 0.0
+            boost_c = 0.0
+            for ti in thinker_indices:
+                d_sq = self._ww_dist_sq[i, ti]
+                if d_sq <= _THINKER_BOOST_RADIUS_SQ:
+                    d = math.sqrt(d_sq)
+                    factor = 1.0 - (d / THINKER_BOOST_RADIUS)
+                    boost_a += THINKER_BOOST_ATTACK_ACCURACY * factor
+                    boost_m += THINKER_BOOST_MOVE_EFFICIENCY * factor
+                    boost_c += THINKER_BOOST_COMM_RANGE * factor
+
+            boosts[worm.id] = {
+                'attack_accuracy': min(boost_a, 0.6),
+                'move_efficiency': min(boost_m, 0.6),
+                'comm_range': min(boost_c, 0.6),
+            }
+        return boosts
+
     def _build_all_flood_observations(self) -> dict:
         """
         Build observation vectors for all alive Flood agents.
-        Uses spatial grid for O(k) neighbor lookups.
+        Uses pre-computed distance matrices — zero Python distance calls.
         """
         observations = {}
         alive_worms = self._alive_worms
         alive_flood = self._alive_flood
+        W = len(alive_worms)
+        F = len(alive_flood)
 
-        for flood in alive_flood:
-            # Use spatial grid for nearby worms
-            flood.nearby_worms = self.worm_grid.query_radius(
-                flood.x, flood.y, FLOOD_VISION)
-            flood.nearby_worms = [w for w in flood.nearby_worms
-                                  if w.alive and
-                                  flood.distance_to_sq(w.x, w.y) <= FLOOD_VISION * FLOOD_VISION]
+        _FLOOD_VISION_SQ = FLOOD_VISION * FLOOD_VISION
 
-            # Use spatial grid for nearby flood
-            flood.nearby_flood = self.flood_grid.query_radius(
-                flood.x, flood.y, FLOOD_VISION)
-            flood.nearby_flood = [f for f in flood.nearby_flood
-                                  if f.id != flood.id and f.alive and
-                                  flood.distance_to_sq(f.x, f.y) <= FLOOD_VISION * FLOOD_VISION]
+        for fi, flood in enumerate(alive_flood):
+            # Nearby worms: from worm-flood distance matrix (column fi)
+            if W > 0:
+                col = self._wf_dist_sq[:, fi]
+                mask = (col <= _FLOOD_VISION_SQ)
+                flood.nearby_worms = [alive_worms[j] for j in range(W) if mask[j]]
+            else:
+                flood.nearby_worms = []
+
+            # Nearby flood: from flood-flood distance matrix
+            if F > 1:
+                row = self._ff_dist_sq[fi]
+                mask = (row <= _FLOOD_VISION_SQ)
+                mask[fi] = False  # exclude self
+                flood.nearby_flood = [alive_flood[j] for j in range(F) if mask[j]]
+            else:
+                flood.nearby_flood = []
 
             # Get or allocate observation buffer
             if flood.id not in self._flood_obs_buffer:
@@ -403,12 +494,11 @@ class LekgoloEnvironment:
         if self.thinker_disrupt_timer > 0:
             self.thinker_disrupt_timer -= 1
 
-        # --- Build alive caches and spatial grids ONCE ---
+        # --- Build alive caches and distance matrices ONCE ---
         self._rebuild_alive_caches()
-        self._rebuild_spatial_grids()
 
-        # Compute thinker boosts ONCE per step
-        self._cached_boosts = compute_all_thinker_boosts(self._alive_worms)
+        # Compute thinker boosts ONCE per step (from distance matrix)
+        self._cached_boosts = self._compute_all_boosts_from_matrix()
         disrupt_active = self.thinker_disrupt_timer > 0
 
         # --- Phase 1: Build observations (once!) ---
