@@ -2,7 +2,8 @@
 Reward system for the Lekgolo colony simulation.
 
 Rewards target OUTCOMES, not behaviors.
-We never reward: "protect thinkers", "build walls", "form brains".
+We never reward: "protect thinkers", "build walls", "form brains",
+"swarm thinkers", "probe weak points".
 Those should EMERGE from the reward structure.
 
 Colony rewards:
@@ -16,12 +17,13 @@ Colony rewards:
   - thinker infection
   - colony fragmentation
 
-Flood rewards:
-  + infect worker
-  + infect thinker
-  + biomass growth
-  + colony fragmentation
-  - Flood deaths
+Flood rewards (outcome-based, asymmetric):
+  + infect worker/thinker (penetration > killing)
+  + biomass growth (replication economy)
+  + colony fragmentation (disruption)
+  + geographic spread (control territory)
+  + survive (per timestep, low - Flood are expendable)
+  - Flood deaths (but penalty is small - they're cheap)
 """
 import numpy as np
 from config import (
@@ -41,6 +43,8 @@ from config import (
     FLOOD_REWARD_COLONY_FRAGMENT,
     FLOOD_REWARD_DEATH,
     FLOOD_REWARD_BIOMASS_GROWTH,
+    FLOOD_REWARD_SURVIVAL_PER_STEP,
+    FLOOD_REWARD_SPREAD_BONUS,
     NUM_WORMS_INITIAL,
     NUM_THINKERS_INITIAL,
 )
@@ -73,9 +77,7 @@ class ColonyRewardTracker:
     def compute_step_reward(self, worms: list, flood_list: list,
                             attachment_system, terrain: np.ndarray,
                             current_biomass: float) -> float:
-        """
-        Compute the colony-level reward for one timestep.
-        """
+        """Compute the colony-level reward for one timestep."""
         reward = 0.0
         alive_worms = [w for w in worms if w.alive]
         alive_workers = [w for w in alive_worms if w.worm_type == 0]
@@ -127,8 +129,6 @@ class ColonyRewardTracker:
 
         # --- Territory control ---
         if alive_worms:
-            # Territory = area covered by worm positions (convex hull would be ideal,
-            # but we use a simpler bounding box + density measure)
             xs = [w.x for w in alive_worms]
             ys = [w.y for w in alive_worms]
             territory = max(0, (max(xs) - min(xs)) * (max(ys) - min(ys)))
@@ -146,7 +146,6 @@ class ColonyRewardTracker:
         # --- Thinker death penalty ---
         for w in worms:
             if not w.alive and w.worm_type == 1 and w.local_damage_taken > 0:
-                # Check if this worm died this step (health just hit 0)
                 if w.health == 0:
                     death_r = REWARD_THINKER_DEATH
                     reward += death_r
@@ -166,7 +165,15 @@ class ColonyRewardTracker:
 
 
 class FloodRewardTracker:
-    """Tracks and computes rewards for the Flood."""
+    """
+    Tracks and computes rewards for the Flood.
+
+    Flood rewards are deliberately asymmetric:
+    - Infection is rewarded far more than killing (conversion economy)
+    - Spread is rewarded (territory control)
+    - Death penalty is small (Flood are expendable)
+    - Colony fragmentation is a major goal (disruption)
+    """
 
     def __init__(self):
         self.reset()
@@ -179,24 +186,30 @@ class FloodRewardTracker:
             'colony_fragment': 0.0,
             'death': 0.0,
             'biomass_growth': 0.0,
+            'survival': 0.0,
+            'spread': 0.0,
         }
 
     def compute_step_reward(self, flood_list: list, prev_count: int,
                             colony_fragmented: bool,
                             biomass_gained: float) -> float:
-        """
-        Compute Flood-level reward for one timestep.
-        """
+        """Compute Flood-level reward for one timestep."""
         reward = 0.0
+        alive_flood = [f for f in flood_list if f.alive]
 
-        # Count Flood deaths this step
-        current_alive = sum(1 for f in flood_list if f.alive)
+        # Survival (very small - Flood are expendable)
+        survival_r = len(alive_flood) * FLOOD_REWARD_SURVIVAL_PER_STEP
+        reward += survival_r
+        self.reward_breakdown['survival'] += survival_r
+
+        # Flood deaths (small penalty)
+        current_alive = len(alive_flood)
         deaths = max(0, prev_count - current_alive)
         death_r = deaths * FLOOD_REWARD_DEATH
         reward += death_r
         self.reward_breakdown['death'] += death_r
 
-        # Colony fragmentation
+        # Colony fragmentation (major goal)
         if colony_fragmented:
             frag_r = FLOOD_REWARD_COLONY_FRAGMENT
             reward += frag_r
@@ -206,6 +219,15 @@ class FloodRewardTracker:
         bio_r = biomass_gained * FLOOD_REWARD_BIOMASS_GROWTH
         reward += bio_r
         self.reward_breakdown['biomass_growth'] += bio_r
+
+        # Geographic spread bonus
+        if alive_flood:
+            xs = [f.x for f in alive_flood]
+            ys = [f.y for f in alive_flood]
+            spread_area = max(0, (max(xs) - min(xs)) * (max(ys) - min(ys)))
+            spread_r = spread_area * FLOOD_REWARD_SPREAD_BONUS
+            reward += spread_r
+            self.reward_breakdown['spread'] += spread_r
 
         self.total_reward += reward
         return reward
